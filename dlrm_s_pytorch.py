@@ -80,6 +80,11 @@ import torch.nn as nn
 from torch.nn.parallel.parallel_apply import parallel_apply
 from torch.nn.parallel.replicate import replicate
 from torch.nn.parallel.scatter_gather import gather, scatter
+
+# for pruning
+from torch.nn.utils import prune
+from torch.utils.tensorboard import SummaryWriter
+
 # quotient-remainder trick
 from tricks.qr_embedding_bag import QREmbeddingBag
 # mixed-dimension trick
@@ -589,7 +594,19 @@ if __name__ == "__main__":
     parser.add_argument("--lr-num-warmup-steps", type=int, default=0)
     parser.add_argument("--lr-decay-start-step", type=int, default=0)
     parser.add_argument("--lr-num-decay-steps", type=int, default=0)
+
+    # Pruning related
+    parser.add_argument("--target-sparsity", type=float, default=0.0)
+    parser.add_argument("--start-step", type=float, default=0.2)
+    parser.add_argument("--end-step", type=float, default=0.5)
+
     args = parser.parse_args()
+
+    # Generate experiment name
+    exp_name = "ts_{:.3f}_st_{}_en_{}".format(args.target_sparsity, args.start_step, args.end_step)
+
+    # Instantiate summary writer
+    writer = SummaryWriter('logs/' + exp_name)
 
     if args.mlperf_logging:
         print('command line args: ', json.dumps(vars(args)))
@@ -866,6 +883,16 @@ if __name__ == "__main__":
             # print(loss_fn_)
             return loss_sc_.mean()
 
+    def get_model_sparsity():
+        total_el = 0
+        total_nz = 0
+        for name, module in dlrm.named_modules():
+            if type(module) == torch.nn.Linear:
+                total_el += float(module.weight.nelement())
+                total_nz += float(torch.sum(module.weight == 0))
+
+        return total_nz / total_el
+
     # training or inference
     best_gA_test = 0
     best_auc_test = 0
@@ -937,6 +964,18 @@ if __name__ == "__main__":
             )
         )
 
+    """
+    import csv
+    grad_norm_fp = open("grad_norm.csv", "w")
+    writer = csv.writer(grad_norm_fp)
+    """
+
+    _modules = []
+    for name, m in dlrm.named_modules():
+        if type(m) == torch.nn.Linear:
+            _modules.append(name)
+    # writer.writerow(_modules)
+
     print("time/loss/accuracy (if enabled):")
     with torch.autograd.profiler.profile(args.enable_profiling, use_gpu) as prof:
         while k < args.nepochs:
@@ -947,6 +986,19 @@ if __name__ == "__main__":
 
             if args.mlperf_logging:
                 previous_iteration_time = None
+
+
+            # Set up pruning parameters
+            start_prune_step = int(len(train_ld) * args.start_step)
+            end_prune_step = int(len(train_ld) * args.end_step)
+
+            num_pruning_steps = end_prune_step - start_prune_step
+
+            target_sparsity = args.target_sparsity
+            start_sparsity = 0.0
+
+            def get_pruning_amount(train_step):
+                return target_sparsity+(start_sparsity-target_sparsity)*(1-(train_step-start_prune_step)/num_pruning_steps)**3
 
             for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
                 if j == 0 and args.save_onnx:
@@ -983,6 +1035,7 @@ if __name__ == "__main__":
 
                 # loss
                 E = loss_fn_wrap(Z, T, use_gpu, device)
+
                 '''
                 # debug prints
                 print("output and loss")
@@ -1007,6 +1060,17 @@ if __name__ == "__main__":
                     #     if hasattr(l, 'weight'):
                     #          print(l.weight.grad.norm().item())
 
+                    """
+                    # Print gradient norm for every linear layer
+
+                    grad_norm = []
+                    for name, m in dlrm.named_modules():
+                        if type(m) == torch.nn.Linear:
+                            grad_norm.append(m.weight.grad.norm().item())
+
+                    writer.writerow(grad_norm)
+                    """
+
                     # optimizer
                     optimizer.step()
                     lr_scheduler.step()
@@ -1021,12 +1085,42 @@ if __name__ == "__main__":
                 total_iter += 1
                 total_samp += mbs
 
+                # Let's using printing interval as the pruning interval
                 should_print = ((j + 1) % args.print_freq == 0) or (j + 1 == nbatches)
+                should_prune = should_print
                 should_test = (
                     (args.test_freq > 0)
                     and (args.data_generation == "dataset")
                     and (((j + 1) % args.test_freq == 0) or (j + 1 == nbatches))
                 )
+
+                if should_prune:
+                    acc_prune_amount = get_pruning_amount(j)
+                    pruning_amount = (acc_prune_amount-get_model_sparsity()) / (1. - get_model_sparsity())
+                    if (
+                        j >= start_prune_step and 
+                        j <= end_prune_step and
+                        get_model_sparsity() < target_sparsity and
+                        pruning_amount >= 0
+                    ):
+                        # Get current sparsity and compare with target sparsity
+                        sparsity = get_model_sparsity()
+
+                        for name, module in dlrm.named_modules():
+                            if type(module) == torch.nn.Linear:
+                                prune.l1_unstructured(
+                                        module, name='weight', amount=pruning_amount)
+
+                        print(
+                                "Pruning complete, before: {:.3f}, after:{:.3f}, prune_amount: {:.3f}, acc_prune: {:.3f}".format(
+                                sparsity,
+                                get_model_sparsity(),
+                                pruning_amount,
+                                acc_prune_amount
+                                )
+                        )
+
+                        writer.add_scalar('sparsity', get_model_sparsity(), j)
 
                 # print time, loss and accuracy
                 if should_print or should_test:
@@ -1051,6 +1145,9 @@ if __name__ == "__main__":
                     # .format(time_wrap(use_gpu) - accum_time_begin))
                     total_iter = 0
                     total_samp = 0
+
+                    writer.add_scalar('tr_loss', gL, j)
+                    writer.add_scalar('tr_acc', gA * 100, j)
 
                 # testing
                 if should_test and not args.inference_only:
@@ -1211,6 +1308,9 @@ if __name__ == "__main__":
                                 gL_test, gA_test * 100, best_gA_test * 100
                             )
                         )
+
+                    writer.add_scalar('te_loss', gL_test, j)
+                    writer.add_scalar('te_acc', gA_test * 100, j)
                     # Uncomment the line below to print out the total time with overhead
                     # print("Total test time for this group: {}" \
                     # .format(time_wrap(use_gpu) - accum_test_time_begin))
@@ -1267,3 +1367,5 @@ if __name__ == "__main__":
         dlrm_pytorch_onnx = onnx.load("dlrm_s_pytorch.onnx")
         # check the onnx model
         onnx.checker.check_model(dlrm_pytorch_onnx)
+
+    #grad_norm_fp.close()
